@@ -64,6 +64,10 @@
 #include "nc_cnn_communicator.h"
 #include "nc_cnn_worker_for_postprocess.h"
 #include "nc_neon.h"
+
+#include "nc_adas_extract.h"
+
+
 #ifdef AIWARE_DEVICE_SUPPORTED
 #include "aiware/runtime/c/aiwaredevice.h"
 #endif
@@ -88,7 +92,7 @@
 ********************************************************************************
 */
 
-#define VIS0_MAX_CH         (4)
+#define VIS0_MAX_CH         (1)
 #define VIS1_MAX_CH         (0)
 #define VIDEO_MAX_CH        (VIS0_MAX_CH + VIS1_MAX_CH)
 
@@ -777,13 +781,15 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
         else{
             uint64_t time_stamp = 0;
 
+
+
         #ifdef DETECT_NETWORK
             pp_result_buf *det_buf = NULL;
             det_buf = (pp_result_buf *)nc_tsfs_ff_get_readable_buffer_and_timestamp(ch+DETECT_NETWORK, &time_stamp);
             if (det_buf) {
                 nc_draw_gl_npu(g_viewport[ch], det_buf->net_task, det_buf, g_npu_prog);
             }
-            nc_tsfs_ff_finish_read_buf(ch+DETECT_NETWORK);
+            //nc_tsfs_ff_finish_read_buf(ch+DETECT_NETWORK);
         #endif
 
         #ifdef SEGMENT_NETWORK
@@ -792,7 +798,7 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
             if (seg_buf) {
                 nc_draw_gl_npu(g_viewport[ch], seg_buf->net_task, seg_buf, g_npu_prog);
             }
-            nc_tsfs_ff_finish_read_buf(ch+SEGMENT_NETWORK);
+            //nc_tsfs_ff_finish_read_buf(ch+SEGMENT_NETWORK);
         #endif
 
         #ifdef LANE_NETWORK
@@ -801,7 +807,21 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
             if (lane_buf) {
                 nc_draw_gl_npu(g_viewport[ch], lane_buf->net_task, lane_buf, g_npu_prog);
             }
+            //nc_tsfs_ff_finish_read_buf(ch+LANE_NETWORK);
+        #endif
+
+        #ifdef DETECT_NETWORK 
+        #ifdef SEGMENT_NETWORK
+        #ifdef LANE_NETWORK
+            AdasResult adas;
+            adas_extract(det_buf, seg_buf, lane_buf, WINDOW_WIDTH, WINDOW_HEIGHT, &adas);
+            adas_extract_debug_print(&adas);
+
+            nc_tsfs_ff_finish_read_buf(ch+DETECT_NETWORK);
+            nc_tsfs_ff_finish_read_buf(ch+SEGMENT_NETWORK);
             nc_tsfs_ff_finish_read_buf(ch+LANE_NETWORK);
+        #endif
+        #endif
         #endif
         }
     }
