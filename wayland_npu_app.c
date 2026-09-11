@@ -909,7 +909,7 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
                 * 일단 주석 권장
                 */
 
-                // adas_extract_debug_print(&adas_result);
+                adas_extract_debug_print(&adas_result);
 
 
                 /*
