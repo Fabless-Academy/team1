@@ -294,6 +294,7 @@ CSRCS               := wayland_npu_app.c
 CSRCS               += nc_adas_extract.c
 CSRCS               += nc_adas_geometry.c
 CSRCS               += nc_adas_risk.c
+CSRCS               += adas_overlay.c
 CSRCS               += $(NC_APP_MODULES)/v4l2/v4l2_interface.c
 CSRCS               += $(NC_APP_MODULES)/config/nc_cnn_config_parser.c
 CSRCS               += $(NC_APP_MODULES)/utils/nc_utils.c

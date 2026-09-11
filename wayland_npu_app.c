@@ -70,6 +70,7 @@
 #include "nc_adas_geometry.h"
 #include "nc_adas_extract.h"
 #include "nc_adas_risk.h"
+#include "adas_overlay.h"
 //-------------------------
 
 
@@ -401,7 +402,13 @@ int v4l2_initialize(void)
     return 0;
 }
 
-void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *net_result, struct gl_npu_program g_npu_prog)
+void nc_draw_gl_npu(
+    struct viewport viewport,
+    int network_task,
+    pp_result_buf *net_result,
+    struct gl_npu_program g_npu_prog,
+    bool *all_stop_requested
+)
 {
     stCnnPostprocessingResults *det_result = &net_result->cnn_result;
     stObjDrawInfo *draw_cnn = &net_result->draw_info;
@@ -434,6 +441,23 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
         for(int i=0; i<draw_cnn->max_class_cnt; i++){
             for(int bidx = 0; bidx < det_result->class_objs[i].obj_cnt; bidx++) {
                 stObjInfo obj_info = det_result->class_objs[i].objs[bidx];
+
+                /*
+                * 현재 ADAS 코드와 동일하게 class 0을 person으로 사용.
+                * person bbox가 중앙 STOP frame과 겹치면 이 프레임의
+                * ALL STOP 요청을 true로 만든다.
+                */
+                if (all_stop_requested != NULL &&
+                    i == 0 &&
+                    adas_person_intersects_stop_frame(
+                        obj_info.bbox.x,
+                        obj_info.bbox.y,
+                        obj_info.bbox.w,
+                        obj_info.bbox.h))
+                {
+                    *all_stop_requested = true;
+                }
+
                 nc_opengl_draw_rectangle(obj_info.bbox.x, obj_info.bbox.y, obj_info.bbox.w, obj_info.bbox.h, color[i], g_npu_prog);
 
                 // draw bbox label
@@ -679,6 +703,11 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
     static uint64_t opengl_time = 0;
     static uint64_t framecnt = 0;
     int networkOrder[VIDEO_MAX_CH];
+    
+    bool all_stop_requested = false;
+
+    AdasOverlayRiskLevel overlay_risk_level =
+        ADAS_OVERLAY_RISK_SAFE;
 
     (void)time;
 
@@ -812,7 +841,8 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
                 g_viewport[ch],
                 det_buf->net_task,
                 det_buf,
-                g_npu_prog
+                g_npu_prog,
+                &all_stop_requested
             );
         }
 
@@ -839,7 +869,8 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
                 g_viewport[ch],
                 seg_buf->net_task,
                 seg_buf,
-                g_npu_prog
+                g_npu_prog,
+                NULL
             );
         }
 
@@ -866,19 +897,121 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
                 g_viewport[ch],
                 lane_buf->net_task,
                 lane_buf,
-                g_npu_prog
+                g_npu_prog,
+                NULL
             );
         }
 
     #endif
 
+    /* =========================================================
+    * DEBUG: Detection / Segmentation / Lane
+    * 하나라도 결과가 있으면 각각 콘솔 출력
+    * ========================================================= */
 
-        /*
-        * 4. ADAS
-        *
-        * Detection / Segmentation / Lane 결과가
-        * 모두 존재하는 경우에만 실행
-        */
+    /* Detection */
+    if (det_buf != NULL)
+    {
+        printf("[DET] ");
+
+        int total_obj = 0;
+
+        for (int class_id = 0;
+            class_id < det_buf->draw_info.max_class_cnt;
+            class_id++)
+        {
+            int obj_cnt =
+                det_buf->cnn_result.class_objs[class_id].obj_cnt;
+
+            total_obj += obj_cnt;
+
+            for (int j = 0; j < obj_cnt; j++)
+            {
+                stObjInfo obj =
+                    det_buf->cnn_result.class_objs[class_id].objs[j];
+
+                printf(
+                    "class=%d prob=%.2f "
+                    "bbox=(%.0f,%.0f,%.0f,%.0f) ",
+                    class_id,
+                    obj.prob,
+                    obj.bbox.x,
+                    obj.bbox.y,
+                    obj.bbox.w,
+                    obj.bbox.h
+                );
+            }
+        }
+
+        if (total_obj == 0)
+            printf("objects=0");
+
+        printf("\n");
+    }
+
+
+    /* Segmentation */
+    if (seg_buf != NULL)
+    {
+        printf(
+            "[SEG] mask=%dx%d ptr=%p\n",
+            seg_buf->seg_info.width,
+            seg_buf->seg_info.height,
+            (void *)seg_buf->cnn_result.seg
+        );
+    }
+
+
+    /* Lane */
+    if (lane_buf != NULL)
+    {
+        printf("[LANE] ");
+
+        int lane_found = 0;
+
+        for (int i = 0;
+            i < lane_buf->lane_draw_info.max_lane_num;
+            i++)
+        {
+            int point_cnt =
+                lane_buf->cnn_result.lane_det[i].point_cnt;
+
+            int lane_class =
+                lane_buf->cnn_result.lane_det[i].lane_class;
+
+            if (point_cnt > 0)
+            {
+                printf(
+                    "lane=%d class=%d points=%d ",
+                    i,
+                    lane_class,
+                    point_cnt
+                );
+
+                lane_found++;
+            }
+        }
+
+        if (lane_found == 0)
+            printf("lanes=0");
+
+        printf("\n");
+    }
+
+    fflush(stdout);
+    /* =========================================================
+    * DEBUG: Detection / Segmentation / Lane
+    * 끝~~~~~~~~~
+    * ========================================================= */
+
+
+
+    /*
+    * 4. ADAS
+    *
+    * Detection / Segmentation / Lane 결과가
+    * 모두 존재하는 경우에만 실행
+    */
     #if defined(DETECT_NETWORK) && \
         defined(SEGMENT_NETWORK) && \
         defined(LANE_NETWORK)
@@ -1036,11 +1169,30 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
     fpscount+=1;
     char buftext[256];
 
+    AdasOverlayResult overlay_result = {};
+
+    overlay_result.level = overlay_risk_level;
+    overlay_result.all_stop_requested = all_stop_requested;
+    overlay_result.fps = (float)fpscount_00;
+    overlay_result.latency_ms = 0.0f;
+
+
+    // TODO 현재 기존 FPS 문구와 overlay의 FPS 문구가 화면 아래쪽에서 겹칠 가능성이 큽니다. Overlay가 제대로 뜨는 것까지 확인한 다음 기존:
+    // sprintf(buftext, "GL: ...");
+    // nc_opengl_draw_text(...);
+    // 는 위치를 옮기거나 제거하는 게 좋습니다.
     sprintf(buftext,"GL: %lums, Frame: %lums/%lufps", opengl_time, frametime, fpscount_00);
 
     glViewport(0,0, WINDOW_WIDTH, WINDOW_HEIGHT);
     float textcolor[3] = {1.0, 0.0, 0.0}; // R, G, B
     nc_opengl_draw_text(&font_38, buftext, 10, 1020, 1.0f, textcolor, WINDOW_WIDTH, WINDOW_HEIGHT, g_font_prog);
+
+    adas_draw_overlay(
+        &overlay_result,
+        g_npu_prog,
+        &font_24,
+        g_font_prog
+    );
 
     clock_gettime(CLOCK_MONOTONIC, &end);
 
