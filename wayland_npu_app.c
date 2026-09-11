@@ -65,7 +65,12 @@
 #include "nc_cnn_worker_for_postprocess.h"
 #include "nc_neon.h"
 
+
+//추가-----------------------
+#include "nc_adas_geometry.h"
 #include "nc_adas_extract.h"
+#include "nc_adas_risk.h"
+//-------------------------
 
 
 #ifdef AIWARE_DEVICE_SUPPORTED
@@ -773,57 +778,258 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
 #endif
 
     // draw cnn network result
-    for(uint32_t ch = 0; ch < VIDEO_MAX_CH; ch++)
+    // draw cnn network result
+    for (uint32_t ch = 0; ch < VIDEO_MAX_CH; ch++)
     {
-        if (v4l2_config[ch].video_buf.video_fd == -1){
-
+        if (v4l2_config[ch].video_buf.video_fd == -1) {
+            continue;
         }
-        else{
-            uint64_t time_stamp = 0;
+
+        uint64_t time_stamp = 0;
+
+        pp_result_buf *det_buf  = NULL;
+        pp_result_buf *seg_buf  = NULL;
+        pp_result_buf *lane_buf = NULL;
 
 
+        /*
+        * 1. Detection
+        *
+        * 원본 순서 유지:
+        * get -> draw
+        */
+    #ifdef DETECT_NETWORK
 
-        #ifdef DETECT_NETWORK
-            pp_result_buf *det_buf = NULL;
-            det_buf = (pp_result_buf *)nc_tsfs_ff_get_readable_buffer_and_timestamp(ch+DETECT_NETWORK, &time_stamp);
-            if (det_buf) {
-                nc_draw_gl_npu(g_viewport[ch], det_buf->net_task, det_buf, g_npu_prog);
-            }
-            //nc_tsfs_ff_finish_read_buf(ch+DETECT_NETWORK);
-        #endif
+        det_buf =
+            (pp_result_buf *)
+            nc_tsfs_ff_get_readable_buffer_and_timestamp(
+                ch + DETECT_NETWORK,
+                &time_stamp
+            );
 
-        #ifdef SEGMENT_NETWORK
-            pp_result_buf *seg_buf = NULL;
-            seg_buf = (pp_result_buf *)nc_tsfs_ff_get_readable_buffer_and_timestamp(ch+SEGMENT_NETWORK, &time_stamp);
-            if (seg_buf) {
-                nc_draw_gl_npu(g_viewport[ch], seg_buf->net_task, seg_buf, g_npu_prog);
-            }
-            //nc_tsfs_ff_finish_read_buf(ch+SEGMENT_NETWORK);
-        #endif
-
-        #ifdef LANE_NETWORK
-            pp_result_buf *lane_buf = NULL;
-            lane_buf = (pp_result_buf *)nc_tsfs_ff_get_readable_buffer_and_timestamp(ch+LANE_NETWORK, &time_stamp);
-            if (lane_buf) {
-                nc_draw_gl_npu(g_viewport[ch], lane_buf->net_task, lane_buf, g_npu_prog);
-            }
-            //nc_tsfs_ff_finish_read_buf(ch+LANE_NETWORK);
-        #endif
-
-        #ifdef DETECT_NETWORK 
-        #ifdef SEGMENT_NETWORK
-        #ifdef LANE_NETWORK
-            AdasResult adas;
-            adas_extract(det_buf, seg_buf, lane_buf, WINDOW_WIDTH, WINDOW_HEIGHT, &adas);
-            adas_extract_debug_print(&adas);
-
-            nc_tsfs_ff_finish_read_buf(ch+DETECT_NETWORK);
-            nc_tsfs_ff_finish_read_buf(ch+SEGMENT_NETWORK);
-            nc_tsfs_ff_finish_read_buf(ch+LANE_NETWORK);
-        #endif
-        #endif
-        #endif
+        if (det_buf != NULL) {
+            nc_draw_gl_npu(
+                g_viewport[ch],
+                det_buf->net_task,
+                det_buf,
+                g_npu_prog
+            );
         }
+
+    #endif
+
+
+        /*
+        * 2. Segmentation
+        *
+        * 원본 순서 유지:
+        * get -> draw
+        */
+    #ifdef SEGMENT_NETWORK
+
+        seg_buf =
+            (pp_result_buf *)
+            nc_tsfs_ff_get_readable_buffer_and_timestamp(
+                ch + SEGMENT_NETWORK,
+                &time_stamp
+            );
+
+        if (seg_buf != NULL) {
+            nc_draw_gl_npu(
+                g_viewport[ch],
+                seg_buf->net_task,
+                seg_buf,
+                g_npu_prog
+            );
+        }
+
+    #endif
+
+
+        /*
+        * 3. Lane
+        *
+        * 원본 순서 유지:
+        * get -> draw
+        */
+    #ifdef LANE_NETWORK
+
+        lane_buf =
+            (pp_result_buf *)
+            nc_tsfs_ff_get_readable_buffer_and_timestamp(
+                ch + LANE_NETWORK,
+                &time_stamp
+            );
+
+        if (lane_buf != NULL) {
+            nc_draw_gl_npu(
+                g_viewport[ch],
+                lane_buf->net_task,
+                lane_buf,
+                g_npu_prog
+            );
+        }
+
+    #endif
+
+
+        /*
+        * 4. ADAS
+        *
+        * Detection / Segmentation / Lane 결과가
+        * 모두 존재하는 경우에만 실행
+        */
+    #if defined(DETECT_NETWORK) && \
+        defined(SEGMENT_NETWORK) && \
+        defined(LANE_NETWORK)
+
+        if ((det_buf  != NULL) &&
+            (seg_buf  != NULL) &&
+            (lane_buf != NULL))
+        {
+            /*
+            * 반드시 초기화
+            */
+            AdasResult adas_result{};
+
+
+            if (adas_extract(
+                    det_buf,
+                    seg_buf,
+                    lane_buf,
+                    WINDOW_WIDTH,
+                    WINDOW_HEIGHT,
+                    &adas_result) == 0)
+            {
+                /*
+                * DEBUG
+                *
+                * 매 frame마다 출력하면
+                * render 속도를 크게 떨어뜨릴 수 있으므로
+                * 일단 주석 권장
+                */
+
+                // adas_extract_debug_print(&adas_result);
+
+
+                /*
+                * Person geometry
+                */
+                for (int i = 0;
+                    i < adas_result.object_count;
+                    i++)
+                {
+                    AdasObject *obj =
+                        &adas_result.objects[i];
+
+
+                    /*
+                    * 현재 person class = 0
+                    */
+                    if (obj->class_id != 0) {
+                        continue;
+                    }
+
+
+                    /*
+                    * bbox bottom-center
+                    */
+                    AdasPoint foot =
+                        adas_bottom_center(
+                            obj
+                        );
+
+
+                    /*
+                    * freespace 확인
+                    */
+                    int on_freespace =
+                        adas_on_freespace(
+                            foot,
+                            &adas_result
+                        );
+
+
+                    /*
+                    * ego lane 확인
+                    */
+                    int in_ego_lane =
+                        adas_in_ego_lane(
+                            foot,
+                            &adas_result
+                        );
+
+
+                    /*
+                    * 이것도 지금은 주석 권장.
+                    * render thread에서 매 frame printf는
+                    * 성능을 크게 떨어뜨릴 수 있음.
+                    */
+
+                    /*
+                    printf(
+                        "[ADAS GEO] "
+                        "ch=%u "
+                        "obj=%d "
+                        "foot=(%d,%d) "
+                        "freespace=%d "
+                        "ego_lane=%d\n",
+                        ch,
+                        i,
+                        foot.x,
+                        foot.y,
+                        on_freespace,
+                        in_ego_lane
+                    );
+                    */
+
+                    /*
+                    * warning 방지용.
+                    * printf 활성화하면 제거 가능.
+                    */
+                    (void)on_freespace;
+                    (void)in_ego_lane;
+                }
+
+
+                /*
+                * Risk
+                */
+                adas_evaluate_frame(
+                    &adas_result
+                );
+            }
+        }
+
+    #endif
+
+
+        /*
+        * 5. Buffer release
+        *
+        * ADAS까지 buffer 사용이 끝난 다음 release.
+        *
+        * 우선 기존 Nextchip 코드의 사용 방식을
+        * 그대로 유지한다.
+        */
+
+    #ifdef DETECT_NETWORK
+        nc_tsfs_ff_finish_read_buf(
+            ch + DETECT_NETWORK
+        );
+    #endif
+
+    #ifdef SEGMENT_NETWORK
+        nc_tsfs_ff_finish_read_buf(
+            ch + SEGMENT_NETWORK
+        );
+    #endif
+
+    #ifdef LANE_NETWORK
+        nc_tsfs_ff_finish_read_buf(
+            ch + LANE_NETWORK
+        );
+    #endif
     }
 
     framecnt++;
