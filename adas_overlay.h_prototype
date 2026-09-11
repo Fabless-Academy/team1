@@ -1,0 +1,41 @@
+#ifndef ADAS_OVERLAY_H
+#define ADAS_OVERLAY_H
+
+#include "nc_opengl_interface.h"
+#include "nc_opengl_ttf_font.h"
+
+typedef enum {
+    // 검출 객체가 위험 구역에 없는 상태
+    RISK_SAFE = 0,
+    // 검출 객체가 주의 구역에 들어온 상태
+    RISK_WARNING,
+    // 검출 객체가 위험 구역에 들어온 상태
+    RISK_DANGER
+} RiskLevel;
+
+typedef struct {
+    // 현재 프레임에서 계산된 최종 위험 단계
+    RiskLevel level;
+    // 위험 지점의 화면 좌표. 현재 오버레이 표시에서는 사용하지 않음
+    float risk_point_x;
+    float risk_point_y;
+    // 현재 화면의 초당 프레임 수
+    float fps;
+    // NPU 추론에 걸린 시간(ms)
+    float latency_ms;
+} RiskResult;
+
+// 새 프레임의 위험 상태를 SAFE로 초기화
+void adas_begin_risk_frame(void);
+// bbox 하단의 정규화된 화면 좌표를 이용해 위험 단계를 갱신
+void adas_update_risk_from_bottom(float normalized_bottom_y);
+// 현재 프레임의 최종 위험 단계 반환
+RiskLevel adas_get_risk_level(void);
+
+// 위험 단계, 위험 구역, FPS 및 NPU 처리 시간을 화면에 표시
+void adas_draw_overlay(const RiskResult *result,
+                       struct gl_npu_program npu_prog,
+                       Font *font,
+                       struct gl_font_program font_prog);
+
+#endif

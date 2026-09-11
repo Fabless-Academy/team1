@@ -63,15 +63,13 @@
 #include "nc_cnn_aiware_runtime.h"
 #include "nc_cnn_communicator.h"
 #include "nc_cnn_worker_for_postprocess.h"
+#include "nc_validation.h"
 #include "nc_neon.h"
-
-#include "nc_adas_extract.h"
-
-
 #ifdef AIWARE_DEVICE_SUPPORTED
 #include "aiware/runtime/c/aiwaredevice.h"
 #endif
 #include "nc_opengl_ttf_font.h"
+#include "adas_overlay.h"
 #ifdef USE_BYTETRACK
 #include "nc_cnn_tracker.h"
 #endif
@@ -92,7 +90,12 @@
 ********************************************************************************
 */
 
-#define VIS0_MAX_CH         (1)
+#ifndef VIS0_MAX_CH
+// Vision0에 연결된 CNN 영상 채널 수입니다. nc_module.ini의 totalch_v0와
+// 일치해야 하며, 기본값은 기존 4채널 구성입니다.
+#define VIS0_MAX_CH         (4)
+#endif
+// 두 번째 카메라 경로를 활성화하지 않는 한 Vision1은 사용하지 않습니다.
 #define VIS1_MAX_CH         (0)
 #define VIDEO_MAX_CH        (VIS0_MAX_CH + VIS1_MAX_CH)
 
@@ -342,6 +345,7 @@ int send_cnn_buf (uint8_t *ptr_cnn_buf, uint64_t time_stamp_us, uint32_t cam_ch,
     }
 
     cnn_data = (stCnnData*)malloc(sizeof(stCnnData));
+    if (!cnn_data) { mq_close(mfd); return -1; }
     cnn_data->cam_ch = cam_ch;
     cnn_data->ptr_cnn_buf = ptr_cnn_buf;
     cnn_data->time_stamp_us = time_stamp_us;
@@ -349,6 +353,7 @@ int send_cnn_buf (uint8_t *ptr_cnn_buf, uint64_t time_stamp_us, uint32_t cam_ch,
 
     if ((ret = mq_send(mfd, (const char *)&cnn_data, attr.mq_msgsize, 1)) == -1) {
         printf("errno of mq_send = %d\n", errno);
+        free(cnn_data);
     }
     mq_close(mfd);
 
@@ -429,9 +434,16 @@ void nc_draw_gl_npu(struct viewport viewport, int network_task, pp_result_buf *n
         for(int i=0; i<draw_cnn->max_class_cnt; i++){
             for(int bidx = 0; bidx < det_result->class_objs[i].obj_cnt; bidx++) {
                 stObjInfo obj_info = det_result->class_objs[i].objs[bidx];
+                // bbox 좌표는 화면 해상도에 맞게 이미 변환되어 있습니다.
+                // bbox의 하단 위치를 화면상 근접도 판단 기준으로 사용합니다.
+                // 현재는 모든 검출 클래스에 적용되므로, 사람 전용 MVP를
+                // 적용할 때는 사람 클래스에만 이 로직을 제한해야 합니다.
+                float bbox_bottom_ratio = (obj_info.bbox.y + obj_info.bbox.h) / (float)WINDOW_HEIGHT;
+                adas_update_risk_from_bottom(bbox_bottom_ratio);
                 nc_opengl_draw_rectangle(obj_info.bbox.x, obj_info.bbox.y, obj_info.bbox.w, obj_info.bbox.h, color[i], g_npu_prog);
 
-                // draw bbox label
+                // 클래스 이름과 검출 신뢰도를 표시합니다. 트래커를 활성화하면
+                // 프레임 간 동일 객체를 추적할 수 있도록 track ID도 표시합니다.
 #ifdef USE_BYTETRACK
                 // show track id (not cnn probability)
                 if (obj_info.track_id < 0) sprintf(buftext, "%s:%0.2f", draw_cnn->class_names[i], obj_info.prob);
@@ -692,6 +704,9 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
 
     glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    // 매 프레임 위험도를 SAFE로 초기화합니다. 아래에서 검출 객체의 위치에 따라
+    // adas_update_risk_from_bottom()이 WARNING 또는 DANGER로 위험도를 높입니다.
+    adas_begin_risk_frame();
 
     for(int i = 0;i<VIDEO_MAX_CH;i++)
     {
@@ -708,15 +723,17 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
 
             // Queue the buffer for capturing a new frame
             if (nc_v4l2_dequeue_buffer(v4l2_config[i].video_buf.video_fd, &video_buf) == -1) {
-                //printf("Error VIDIOC_DQBUF buffer %d\n", video_buf.index);
+                ncv_event("dequeue_error", 0, (unsigned)i, -1, 0, errno);
             }else
             {
+uint64_t dequeue_us = ncv_now();
+                ncv_event("input_dequeue", dequeue_us, (unsigned)i, -1, 0, (long)video_buf.sequence);
 #if (VIDEO_MAX_CH == 4)
                 if (((framecnt % 2 == 0) && (i == 0 || i == 2)) ||
                     ((framecnt % 2 == 1) && (i == 1 || i == 3)))
 #endif
                 {
-                    uint64_t time_stamp_us = 0;
+                    uint64_t time_stamp_us = dequeue_us;
                     networkOrder[i] = nc_get_cnn_networks_id();
                     unsigned char* rgbdata_for_cnn = (unsigned char *)malloc(npu_input_info.rgb_size);
 #ifdef USE_8MP_VI
@@ -730,7 +747,9 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
 #else
                     memcpy(rgbdata_for_cnn, (unsigned char *)v4l2_config[i].video_buf.buffers[video_buf.index].start, npu_input_info.rgb_size); // 600us
 #endif
-                    send_cnn_buf (rgbdata_for_cnn, time_stamp_us, (uint32_t)i, (E_NETWORK_UID)networkOrder[i]);// 50us
+                    int queue_rc = send_cnn_buf(rgbdata_for_cnn, time_stamp_us, (uint32_t)i, (E_NETWORK_UID)networkOrder[i]);
+                    ncv_event(queue_rc == 0 ? "cnn_enqueue" : "queue_error", time_stamp_us, (unsigned)i, (int)networkOrder[i], 0, queue_rc);
+                    if (queue_rc != 0) free(rgbdata_for_cnn);
                     // printf("send cnn msg : %llu us\n", nc_elapsed_us_time(start_time));
                 }
 #ifndef USE_8MP_VI
@@ -781,15 +800,13 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
         else{
             uint64_t time_stamp = 0;
 
-
-
         #ifdef DETECT_NETWORK
             pp_result_buf *det_buf = NULL;
             det_buf = (pp_result_buf *)nc_tsfs_ff_get_readable_buffer_and_timestamp(ch+DETECT_NETWORK, &time_stamp);
             if (det_buf) {
                 nc_draw_gl_npu(g_viewport[ch], det_buf->net_task, det_buf, g_npu_prog);
             }
-            //nc_tsfs_ff_finish_read_buf(ch+DETECT_NETWORK);
+            nc_tsfs_ff_finish_read_buf(ch+DETECT_NETWORK);
         #endif
 
         #ifdef SEGMENT_NETWORK
@@ -798,7 +815,7 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
             if (seg_buf) {
                 nc_draw_gl_npu(g_viewport[ch], seg_buf->net_task, seg_buf, g_npu_prog);
             }
-            //nc_tsfs_ff_finish_read_buf(ch+SEGMENT_NETWORK);
+            nc_tsfs_ff_finish_read_buf(ch+SEGMENT_NETWORK);
         #endif
 
         #ifdef LANE_NETWORK
@@ -807,21 +824,7 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
             if (lane_buf) {
                 nc_draw_gl_npu(g_viewport[ch], lane_buf->net_task, lane_buf, g_npu_prog);
             }
-            //nc_tsfs_ff_finish_read_buf(ch+LANE_NETWORK);
-        #endif
-
-        #ifdef DETECT_NETWORK 
-        #ifdef SEGMENT_NETWORK
-        #ifdef LANE_NETWORK
-            AdasResult adas;
-            adas_extract(det_buf, seg_buf, lane_buf, WINDOW_WIDTH, WINDOW_HEIGHT, &adas);
-            adas_extract_debug_print(&adas);
-
-            nc_tsfs_ff_finish_read_buf(ch+DETECT_NETWORK);
-            nc_tsfs_ff_finish_read_buf(ch+SEGMENT_NETWORK);
             nc_tsfs_ff_finish_read_buf(ch+LANE_NETWORK);
-        #endif
-        #endif
         #endif
         }
     }
@@ -829,12 +832,23 @@ void render(void *data, struct wl_callback *callback, uint32_t time)
     framecnt++;
     fpscount+=1;
     char buftext[256];
+    RiskResult risk_result = {
+        // 이 프레임을 그리는 동안 계산된 가장 높은 위험도를 가져옵니다.
+        // 오버레이는 이 상태를 표시할 뿐, 실제 물리 거리를 계산하지는 않습니다.
+        adas_get_risk_level(),
+        0.0f,
+        0.0f,
+        (float)fpscount_00,
+        (float)opengl_time
+    };
 
     sprintf(buftext,"GL: %lums, Frame: %lums/%lufps", opengl_time, frametime, fpscount_00);
 
     glViewport(0,0, WINDOW_WIDTH, WINDOW_HEIGHT);
     float textcolor[3] = {1.0, 0.0, 0.0}; // R, G, B
     nc_opengl_draw_text(&font_38, buftext, 10, 1020, 1.0f, textcolor, WINDOW_WIDTH, WINDOW_HEIGHT, g_font_prog);
+    // MVP 화면에 SAFE/WARNING/DANGER 상태와 위험 구역 안내선을 표시합니다.
+    adas_draw_overlay(&risk_result, g_npu_prog, &font_24, g_font_prog);
 
     clock_gettime(CLOCK_MONOTONIC, &end);
 
@@ -1005,7 +1019,10 @@ void *cnn_task(void *arg)
     while (running) {
         stCnnData *cnn_data = NULL;
         if(receive_cnn_buf(&cnn_data) != -1){
+            ncv_event("inference_start", cnn_data->time_stamp_us, cnn_data->cam_ch, (int)cnn_data->net_id, 0, 0);
+            uint64_t call_start = ncv_now();
             nc_aiw_run_cnn(cnn_data->ptr_cnn_buf, cnn_data->time_stamp_us, cnn_data->cam_ch, cnn_data->net_id);
+            ncv_event("cnn_call_end", cnn_data->time_stamp_us, cnn_data->cam_ch, (int)cnn_data->net_id, ncv_now() - call_start, 0);
             if(cnn_data) {
                 free(cnn_data->ptr_cnn_buf);
                 free(cnn_data);
